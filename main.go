@@ -110,22 +110,30 @@ func main() {
 
 		done <- struct{}{}
 	}()
+
 	// wait for stop
 	if *statisticInterval == time.Duration(0) {
 		<-done
 		return
 	}
+	statisticAndReset := func(exit bool) {
+		// 	统计一波并清除
+		mu.Lock()
+		defer mu.Unlock()
+		defer counter.Reset()
+		if exit && counter.Count == int64(pinger.PacketsRecv) {
+			return
+		}
+		fmt.Println(counter.String())
+	}
+	defer statisticAndReset(true)
 
 	logIntervalTimer := time.NewTicker(*statisticInterval)
 	defer logIntervalTimer.Stop()
 	for exit := false; !exit; {
 		select {
 		case <-logIntervalTimer.C:
-			// 	统计一波并清除
-			mu.Lock()
-			fmt.Println(counter.String())
-			counter.Reset()
-			mu.Unlock()
+			statisticAndReset(false)
 		case <-done:
 			exit = true
 			break
