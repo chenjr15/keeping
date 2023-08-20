@@ -3,8 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
+	"sync"
 	"time"
 
 	probing "github.com/prometheus-community/pro-bing"
@@ -13,7 +15,7 @@ import (
 var usage = `
 Usage:
 
-    ping [-c count] [-i interval] [-t timeout] [--privileged] host
+    ping [-c count] [-i interval] [-t timeout] [--privileged] [-k  statistic interval] host
 
 Examples:
 
@@ -39,6 +41,7 @@ Examples:
 func main() {
 	timeout := flag.Duration("t", time.Second*100000, "")
 	interval := flag.Duration("i", time.Second, "")
+	statisticInterval := flag.Duration("k", 0, "")
 	count := flag.Int("c", -1, "")
 	size := flag.Int("s", 24, "")
 	ttl := flag.Int("l", 64, "TTL")
@@ -68,8 +71,11 @@ func main() {
 			pinger.Stop()
 		}
 	}()
+	counter := &Counter{}
+	mu := &sync.Mutex{}
 
 	pinger.OnRecv = func(pkt *probing.Packet) {
+		counter.UpdateSync(mu, int64(pkt.Rtt))
 		fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v ttl=%v\n",
 			pkt.Nbytes, pkt.IPAddr, pkt.Seq, pkt.Rtt, pkt.TTL)
 	}
@@ -93,8 +99,80 @@ func main() {
 	pinger.SetPrivileged(*privileged)
 
 	fmt.Printf("PING %s (%s):\n", pinger.Addr(), pinger.IPAddr())
-	err = pinger.Run()
-	if err != nil {
-		fmt.Println("Failed to ping target host:", err)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		err = pinger.Run()
+		if err != nil {
+			fmt.Println("Failed to ping target host:", err)
+		}
+
+		done <- struct{}{}
+	}()
+	// wait for stop
+	if *statisticInterval == time.Duration(0) {
+		<-done
+		return
 	}
+
+	logIntervalTimer := time.NewTicker(*statisticInterval)
+	defer logIntervalTimer.Stop()
+	for exit := false; !exit; {
+		select {
+		case <-logIntervalTimer.C:
+			// 	统计一波并清除
+			mu.Lock()
+			fmt.Println(counter.String())
+			counter.Reset()
+			mu.Unlock()
+		case <-done:
+			exit = true
+			break
+		}
+	}
+}
+
+type Counter struct {
+	Count    int64
+	Min      int64
+	Max      int64
+	Avg      int64
+	StdDevM2 int64
+}
+
+func (cnt *Counter) String() string {
+	return fmt.Sprintf("%d packets,RTT min/avg/max/stddev = %v/%v/%v/%v", cnt.Count,
+		time.Duration(cnt.Min), time.Duration(cnt.Avg), time.Duration(cnt.Max), time.Duration(cnt.StdDevM2))
+}
+func (cnt *Counter) Reset() {
+	cnt.Count = 0
+	cnt.Min = 0
+	cnt.Max = 0
+	cnt.Avg = 0
+	cnt.StdDevM2 = 0
+}
+
+func (cnt *Counter) UpdateSync(mu *sync.Mutex, val int64) {
+	mu.Lock()
+	defer mu.Unlock()
+	cnt.Update(val)
+}
+func (cnt *Counter) Update(val int64) {
+
+	if cnt.Count == 1 || val < cnt.Min {
+		cnt.Min = val
+	}
+
+	if val > cnt.Max {
+		cnt.Max = val
+	}
+	cnt.Count++
+	pktCount := cnt.Count
+	// ref: pro-bing/ping.go#Pinger.updateStatistics
+	delta := val - cnt.Avg
+	cnt.Avg += delta / pktCount
+	delta2 := val - cnt.Avg
+	cnt.StdDevM2 += delta * delta2
+	cnt.StdDevM2 = int64(math.Sqrt(float64(cnt.StdDevM2 / pktCount)))
 }
